@@ -147,8 +147,9 @@ mod test {
             &Builder {
                 inodes_per_group: 1024,
                 blocks_per_group,
-                size,
+                size: size.into(),
                 root_dir: None,
+                paths: None,
             },
         )
         .unwrap();
@@ -201,8 +202,9 @@ mod test {
             &Builder {
                 inodes_per_group: 512,
                 blocks_per_group,
-                size: mem_size,
+                size: mem_size.into(),
                 root_dir: None,
+                paths: None,
             },
         )
         .unwrap();

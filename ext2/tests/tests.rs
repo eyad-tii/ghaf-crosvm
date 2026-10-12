@@ -123,7 +123,7 @@ fn test_mkfs_empty_multi_block_groups() {
         Builder {
             blocks_per_group,
             inodes_per_group: 4096,
-            size: 4096 * blocks_per_group * num_groups,
+            size: (4096 * blocks_per_group * num_groups).into(),
             ..Default::default()
         },
     );
@@ -611,6 +611,32 @@ fn test_multiple_block_directory_entry() {
     assert_eq_dirs(&td, &dir, &disk, None); // skip xattr check
 }
 
+#[test]
+fn test_indirect_block_directory_entry() {
+    // Directory entries need more than 12 blocks, so the indirect block is used.
+    let td = tempdir().unwrap();
+    let dir = td.path().join("testdata");
+
+    std::fs::create_dir(&dir).unwrap();
+
+    for i in 0..2000 {
+        let path = dir.join(format!("{i:040}"));
+        File::create(&path).unwrap();
+    }
+
+    let disk = mkfs(
+        &td,
+        Builder {
+            blocks_per_group: 2048,
+            inodes_per_group: 4096,
+            root_dir: Some(dir.clone()),
+            ..Default::default()
+        },
+    );
+
+    assert_eq_dirs(&td, &dir, &disk, None);
+}
+
 // Test a case where the inode tables spans multiple block groups.
 #[test]
 fn test_multiple_bg_multi_inode_bitmap() {
@@ -642,8 +668,9 @@ fn test_multiple_bg_multi_inode_bitmap() {
         Builder {
             blocks_per_group,
             inodes_per_group,
-            size: BLOCK_SIZE * blocks_per_group * num_groups,
+            size: (BLOCK_SIZE * blocks_per_group * num_groups).into(),
             root_dir: Some(dir.clone()),
+            paths: None,
         },
     );
 
@@ -681,8 +708,9 @@ fn test_multiple_bg_multi_block_bitmap() {
         Builder {
             blocks_per_group,
             inodes_per_group,
-            size: BLOCK_SIZE * blocks_per_group * num_groups,
+            size: (BLOCK_SIZE * blocks_per_group * num_groups).into(),
             root_dir: Some(dir.clone()),
+            paths: None,
         },
     );
 
@@ -719,8 +747,9 @@ fn test_multiple_bg_big_files() {
         Builder {
             blocks_per_group,
             inodes_per_group: 1024,
-            size: BLOCK_SIZE * blocks_per_group * num_groups,
+            size: (BLOCK_SIZE * blocks_per_group * num_groups).into(),
             root_dir: Some(dir.clone()),
+            paths: None,
         },
     );
 
@@ -787,4 +816,165 @@ fn test_mkfs_xattr_impl() {
 #[test]
 fn test_mkfs_xattr() {
     call_test_with_sudo("test_mkfs_xattr_impl")
+}
+
+#[test]
+fn test_mkfs_paths_allowlist() {
+    // testdata
+    // ├── a.txt
+    // ├── b
+    // │   └── c.txt
+    // └── d.txt  (not listed)
+    let td = tempdir().unwrap();
+    let dir = td.path().join("testdata");
+    create_dir(&dir).unwrap();
+    File::create(dir.join("a.txt")).unwrap();
+    create_dir(dir.join("b")).unwrap();
+    fs::write(dir.join("b/c.txt"), vec![1u8; 100 * BLOCK_SIZE as usize]).unwrap();
+    File::create(dir.join("d.txt")).unwrap();
+    let list = td.path().join("paths");
+    fs::write(&list, "/nix/store/a.txt\n\n/nix/store/b\n").unwrap();
+
+    let mut builder = Builder {
+        blocks_per_group: 1024,
+        inodes_per_group: 1024,
+        root_dir: Some(dir.clone()),
+        paths: Some(ext2::read_paths_file(&list).unwrap()),
+        ..Default::default()
+    };
+    builder.set_auto_size(&dir).unwrap();
+    assert_eq!(builder.size, 4096 * 1024);
+    let disk = mkfs(&td, builder);
+
+    fs::remove_file(dir.join("d.txt")).unwrap();
+    assert_eq_dirs(&td, &dir, &disk, None);
+}
+
+#[test]
+fn test_mkfs_paths_missing() {
+    let td = tempdir().unwrap();
+    let dir = td.path().join("testdata");
+    create_dir(&dir).unwrap();
+    File::create(dir.join("a.txt")).unwrap();
+
+    let mut builder = Builder {
+        root_dir: Some(dir.clone()),
+        paths: Some(vec!["a.txt".into(), "missing".into()]),
+        ..Default::default()
+    };
+    assert!(builder.set_auto_size(&dir).is_err());
+}
+
+
+#[test]
+fn test_cache_round_trip() {
+    use ext2::CachedMapping;
+
+    let td = tempdir().unwrap();
+    let dir = td.path().join("testdata");
+    create_dir(&dir).unwrap();
+    create_dir(dir.join("a")).unwrap();
+    fs::write(dir.join("a/x"), vec![7u8; 3 * BLOCK_SIZE as usize + 5]).unwrap();
+    create_dir(dir.join("b")).unwrap();
+    fs::write(dir.join("b/y"), b"y").unwrap();
+    let builder = Builder {
+        blocks_per_group: 2048,
+        inodes_per_group: 4096,
+        root_dir: Some(dir.clone()),
+        paths: Some(vec!["a".into(), "b".into()]),
+        ..Default::default()
+    };
+
+    let built = builder
+        .clone()
+        .allocate_memory()
+        .unwrap()
+        .build_mmap_info()
+        .unwrap();
+    let mappings: Vec<CachedMapping> = built.mapping_info.iter().map(Into::into).collect();
+    assert!(mappings.iter().any(|m| m.path == Path::new("a/x")));
+    let mut cache = Vec::new();
+    built
+        .write_cache(&mut cache, &builder, &[0..builder.size as usize], &mappings)
+        .unwrap();
+
+    let restored = builder
+        .clone()
+        .allocate_memory()
+        .unwrap()
+        .restore(cache.as_slice())
+        .unwrap();
+    let restored_mappings: Vec<CachedMapping> =
+        restored.mapping_info.iter().map(Into::into).collect();
+    assert_eq!(restored_mappings, mappings);
+    let cache_file = td.path().join("cache.zst");
+    fs::write(&cache_file, &cache).unwrap();
+    assert_eq!(
+        ext2::cached_size(
+            &cache_file,
+            &Builder {
+                size: 0,
+                ..builder.clone()
+            }
+        )
+        .unwrap(),
+        builder.size
+    );
+    let (a, b) = (built.do_mmap().unwrap(), restored.do_mmap().unwrap());
+    // SAFETY: both mappings are valid for their size.
+    let (a, b) = unsafe {
+        (
+            std::slice::from_raw_parts(a.as_ptr(), a.size()),
+            std::slice::from_raw_parts(b.as_ptr(), b.size()),
+        )
+    };
+    assert!(a == b);
+
+    let only_b = Builder {
+        paths: Some(vec!["b".into()]),
+        ..builder.clone()
+    };
+    assert!(only_b
+        .allocate_memory()
+        .unwrap()
+        .restore(cache.as_slice())
+        .is_err());
+    create_dir(dir.join("c")).unwrap();
+    let with_c = Builder {
+        paths: Some(vec!["a".into(), "b".into(), "c".into()]),
+        ..builder.clone()
+    };
+    assert!(with_c
+        .allocate_memory()
+        .unwrap()
+        .restore(cache.as_slice())
+        .is_err());
+    let outside = td.path().join("outside");
+    fs::rename(dir.join("a"), &outside).unwrap();
+    symlink(&outside, dir.join("a")).unwrap();
+    assert!(builder
+        .clone()
+        .allocate_memory()
+        .unwrap()
+        .restore(cache.as_slice())
+        .is_err());
+    fs::remove_file(dir.join("a")).unwrap();
+    fs::rename(&outside, dir.join("a")).unwrap();
+    fs::write(dir.join("b/y"), b"yy").unwrap();
+    assert!(builder
+        .allocate_memory()
+        .unwrap()
+        .restore(cache.as_slice())
+        .is_err());
+}
+
+#[test]
+fn test_mkfs_too_many_groups() {
+    let builder = Builder {
+        blocks_per_group: 8,
+        inodes_per_group: 8,
+        size: 8 * BLOCK_SIZE as u64 * (u16::MAX as u64 + 1),
+        ..Default::default()
+    };
+    assert!(builder.allocate_memory().unwrap().build_mmap_info().is_err());
 }
